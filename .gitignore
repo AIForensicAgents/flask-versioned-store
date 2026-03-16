@@ -1,12 +1,12 @@
 __pycache__/
 *.pyc
 *.pyo
-data/
-cert.pem
-key.pem
-tokens.json
 .env
-venv/
+*.pem
+/data/
+.DS_Store
 *.egg-info/
 dist/
 build/
+.venv/
+venv/

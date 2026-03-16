@@ -4,7 +4,6 @@ import hashlib
 import mimetypes
 from flask import Flask, request, jsonify, Response
 from functools import wraps
-from flask_cors import CORS
 
 # --- config.py functionality ---
 class Config:
@@ -143,6 +142,7 @@ def write_key(key, value, email, content_type=None):
 
     version = _get_next_version(key_dir)
 
+    # Determine extension from content_type
     ext = ''
     if content_type:
         guessed = mimetypes.guess_extension(content_type)
@@ -159,6 +159,7 @@ def write_key(key, value, email, content_type=None):
         with open(version_path, 'w') as f:
             f.write(value)
 
+    # Store metadata
     meta_path = os.path.join(versions_dir, f"v{version}.meta.json")
     meta = {
         'version': version,
@@ -185,12 +186,14 @@ def read_key(key, email, version=None):
         return None, None, 'Key not found'
 
     if version is not None:
+        # Find specific version
         meta_path = os.path.join(versions_dir, f"v{version}.meta.json")
         if os.path.exists(meta_path):
             with open(meta_path, 'r') as f:
                 meta = json.load(f)
             version_path = os.path.join(versions_dir, meta['filename'])
         else:
+            # Try finding version file without meta
             found = None
             for fname in os.listdir(versions_dir):
                 if fname.startswith(f"v{version}") and not fname.endswith('.meta.json'):
@@ -209,6 +212,7 @@ def read_key(key, email, version=None):
 
         return data, meta, None
     else:
+        # Get latest version
         latest = _get_latest_version(key_dir)
         if latest is None:
             return None, None, 'No versions found'
@@ -239,19 +243,121 @@ def serve_key(key, email, version=None):
 app = Flask(__name__)
 app.config.from_object(Config)
 
-# Enable CORS for all routes
-CORS(
-    app,
-    resources={r"/*": {"origins": "*"}},
-    allow_headers=["Content-Type", "Authorization"],
-    methods=["GET", "POST", "OPTIONS"]
-)
-
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'healthy'}), 200
 
-# (rest of your original routes unchanged)
+@app.route('/token', methods=['POST'])
+def create_token():
+    data = request.get_json()
+    if not data or 'email' not in data:
+        return jsonify({'error': 'email is required'}), 400
+
+    email = data['email']
+    if not email or not isinstance(email, str) or '@' not in email:
+        return jsonify({'error': 'Invalid email'}), 400
+
+    token = generate_token(email)
+    return jsonify({'token': token, 'email': email}), 200
+
+@app.route('/write', methods=['POST'])
+@require_token
+def write():
+    content_type_header = request.content_type or ''
+
+    if 'application/json' in content_type_header:
+        data = request.get_json()
+        if not data or 'key' not in data:
+            return jsonify({'error': 'key is required'}), 400
+
+        key = data['key']
+        value = data.get('value', '')
+        ct = data.get('content_type', 'application/octet-stream')
+
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value)
+            if ct == 'application/octet-stream':
+                ct = 'application/json'
+    else:
+        key = request.form.get('key')
+        if not key:
+            return jsonify({'error': 'key is required'}), 400
+
+        if 'file' in request.files:
+            file = request.files['file']
+            value = file.read()
+            ct = file.content_type or 'application/octet-stream'
+        else:
+            value = request.form.get('value', '')
+            ct = request.form.get('content_type', 'application/octet-stream')
+
+    email = request.email
+    version, error = write_key(key, value, email, content_type=ct)
+
+    if error:
+        return jsonify({'error': error}), 403
+
+    return jsonify({
+        'key': key,
+        'version': version,
+        'message': 'Written successfully'
+    }), 200
+
+@app.route('/read', methods=['POST'])
+@require_token
+def read():
+    data = request.get_json()
+    if not data or 'key' not in data:
+        return jsonify({'error': 'key is required'}), 400
+
+    key = data['key']
+    version = data.get('version')
+    email = request.email
+
+    content, meta, error = read_key(key, email, version)
+
+    if error:
+        if 'Forbidden' in error:
+            return jsonify({'error': error}), 403
+        return jsonify({'error': error}), 404
+
+    # Try to decode as text
+    try:
+        value = content.decode('utf-8')
+        # Try to parse as JSON
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    except (UnicodeDecodeError, AttributeError):
+        value = base64.b64encode(content).decode('utf-8')
+
+    return jsonify({
+        'key': key,
+        'value': value,
+        'version': meta.get('version'),
+        'content_type': meta.get('content_type', 'application/octet-stream')
+    }), 200
+
+@app.route('/serve', methods=['POST'])
+@require_token
+def serve():
+    data = request.get_json()
+    if not data or 'key' not in data:
+        return jsonify({'error': 'key is required'}), 400
+
+    key = data['key']
+    version = data.get('version')
+    email = request.email
+
+    content, content_type, error = serve_key(key, email, version)
+
+    if error:
+        if 'Forbidden' in error:
+            return jsonify({'error': error}), 403
+        return jsonify({'error': error}), 404
+
+    return Response(content, mimetype=content_type)
 
 if __name__ == '__main__':
     os.makedirs(Config.STORAGE_BASE_DIR, exist_ok=True)

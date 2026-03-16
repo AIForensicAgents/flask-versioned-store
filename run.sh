@@ -1,12 +1,13 @@
 #!/bin/bash
-# Generate self-signed certificate if not present
-if [ ! -f cert.pem ] || [ ! -f key.pem ]; then
-    echo "Generating self-signed certificate..."
-    python generate_cert.py
+set -e
+export FLASK_ENV=${FLASK_ENV:-development}
+export PORT=${PORT:-8080}
+export STORAGE_BASE_DIR=${STORAGE_BASE_DIR:-./data/store}
+
+mkdir -p "$STORAGE_BASE_DIR"
+
+if [ "$FLASK_ENV" = "production" ]; then
+  exec gunicorn --bind 0.0.0.0:$PORT --workers 2 app:app
+else
+  exec python app.py
 fi
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the application
-python app.py

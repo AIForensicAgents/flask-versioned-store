@@ -1,5 +1,9 @@
+__pycache__
+*.pyc
+.git
+.env
+*.pem
+.dockerignore
+Dockerfile
 fly.toml
-.git/
-__pycache__/
-.envrc
-.venv/
+README.md

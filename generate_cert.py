@@ -1,8 +1,14 @@
+"""Generate a self-signed SSL certificate for local development."""
+
 import subprocess
-import os
 
 
-def generate_cert(cert_file="cert.pem", key_file="key.pem", days=365, common_name="localhost"):
+def generate_cert(
+    cert_file: str = "cert.pem",
+    key_file: str = "key.pem",
+    days: int = 365,
+    common_name: str = "localhost",
+) -> None:
     """Generate a self-signed SSL certificate using OpenSSL."""
     cmd = [
         "openssl", "req", "-x509",
@@ -11,7 +17,7 @@ def generate_cert(cert_file="cert.pem", key_file="key.pem", days=365, common_nam
         "-out", cert_file,
         "-days", str(days),
         "-nodes",
-        "-subj", f"/CN={common_name}"
+        "-subj", f"/CN={common_name}",
     ]
 
     try:

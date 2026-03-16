@@ -1,212 +1,232 @@
+"""Versioned filesystem storage engine.
+
+Keys are mapped to a three-level directory hierarchy derived from the
+SHA-256 hash of the key name.  Each key directory contains an
+``owner.json`` file (first writer wins) and a ``versions/`` folder with
+individually numbered version files plus accompanying metadata.
+"""
+
 import hashlib
 import json
-import os
-import time
 import mimetypes
+import os
+from typing import Any
 
 
-def _get_key_dir(base_dir, key):
-    """Compute the 3-level directory structure from the SHA256 hash of the key."""
-    key_hash = hashlib.sha256(key.encode('utf-8')).hexdigest()
-    level1 = key_hash[0:2]
-    level2 = key_hash[2:4]
-    level3 = key_hash[4:6]
-    return os.path.join(base_dir, level1, level2, level3, key_hash)
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _get_key_hash(key: str) -> str:
+    """Return the hex SHA-256 digest of *key*."""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
-def _check_owner(key_dir, email):
-    """Check owner.json in the key directory. Returns True if owner matches or no owner exists yet.
-    Raises PermissionError if owner doesn't match."""
-    owner_path = os.path.join(key_dir, 'owner.json')
-    if os.path.exists(owner_path):
-        with open(owner_path, 'r', encoding='utf-8') as f:
-            owner_data = json.load(f)
-        if owner_data.get('email') != email:
-            raise PermissionError(
-                f"Permission denied: key is owned by '{owner_data.get('email')}', "
-                f"not '{email}'"
-            )
-        return True
-    return False
+def _get_key_dir(base_dir: str, key: str) -> str:
+    """Compute the three-level directory path for *key*."""
+    h = _get_key_hash(key)
+    return os.path.join(base_dir, h[:2], h[2:4], h[4:6], h)
 
 
-def _set_owner(key_dir, email):
-    """Write owner.json to claim ownership of a key directory."""
-    owner_path = os.path.join(key_dir, 'owner.json')
-    owner_data = {'email': email}
-    with open(owner_path, 'w', encoding='utf-8') as f:
-        json.dump(owner_data, f, indent=2)
+def _get_owner(key_dir: str) -> str | None:
+    """Read the owner email from *key_dir*/owner.json, or None."""
+    owner_file = os.path.join(key_dir, "owner.json")
+    if os.path.exists(owner_file):
+        with open(owner_file, "r", encoding="utf-8") as f:
+            return json.load(f).get("email")
+    return None
 
 
-def _get_versions(key_dir):
-    """Get sorted list of version files in the key directory."""
-    versions = []
-    if not os.path.exists(key_dir):
+def _set_owner(key_dir: str, email: str) -> None:
+    """Persist *email* as the owner of *key_dir*."""
+    owner_file = os.path.join(key_dir, "owner.json")
+    with open(owner_file, "w", encoding="utf-8") as f:
+        json.dump({"email": email}, f, indent=2)
+
+
+def _check_owner(key_dir: str, email: str) -> bool:
+    """Verify ownership.  Returns True if *email* matches the owner.
+
+    Returns False when no owner has been set yet.
+    Raises ``PermissionError`` if the key belongs to someone else.
+    """
+    owner = _get_owner(key_dir)
+    if owner is None:
+        return False
+    if owner != email:
+        raise PermissionError(f"Forbidden: key is owned by '{owner}', not '{email}'")
+    return True
+
+
+def _list_versions(versions_dir: str) -> list[tuple[int, str]]:
+    """Return a sorted list of ``(version_number, filename)`` tuples."""
+    versions: list[tuple[int, str]] = []
+    if not os.path.exists(versions_dir):
         return versions
-    for filename in os.listdir(key_dir):
-        if filename.startswith('v') and filename.endswith('.json'):
-            try:
-                version_num = int(filename[1:].replace('.json', ''))
-                versions.append((version_num, filename))
-            except ValueError:
-                continue
+    for fname in os.listdir(versions_dir):
+        if fname.endswith(".meta.json"):
+            continue
+        if not fname.startswith("v"):
+            continue
+        try:
+            v = int(fname.split(".")[0].removeprefix("v"))
+            versions.append((v, fname))
+        except (ValueError, IndexError):
+            continue
     versions.sort(key=lambda x: x[0])
     return versions
 
 
-def _get_next_version(key_dir):
-    """Get the next version number for a key."""
-    versions = _get_versions(key_dir)
+def _get_next_version(versions_dir: str) -> int:
+    """Return the next version number to use."""
+    versions = _list_versions(versions_dir)
     if not versions:
         return 1
     return versions[-1][0] + 1
 
 
-def _get_latest_version_path(key_dir):
-    """Get the file path of the latest version."""
-    versions = _get_versions(key_dir)
-    if not versions:
-        return None
-    return os.path.join(key_dir, versions[-1][1])
+def _get_latest_version(versions_dir: str) -> tuple[int, str] | None:
+    """Return ``(version_number, filename)`` for the latest version, or None."""
+    versions = _list_versions(versions_dir)
+    return versions[-1] if versions else None
 
 
-def write_key(base_dir, key, value, email):
-    """Write a versioned value for a key.
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
-    Args:
-        base_dir: Base directory for storage
-        key: The key name
-        value: The value to store (can be any JSON-serializable object)
-        email: Email of the user performing the write
+def write_key(
+    base_dir: str,
+    key: str,
+    value: str | bytes,
+    email: str,
+    content_type: str | None = None,
+) -> tuple[int | None, str | None]:
+    """Write a new version of *key*.
 
-    Returns:
-        dict: Metadata about the written version including key, version, timestamp, email
-
-    Raises:
-        PermissionError: If the key is owned by a different email
+    Returns ``(version, None)`` on success or ``(None, error_message)`` on
+    failure (e.g. ownership mismatch).
     """
     key_dir = _get_key_dir(base_dir, key)
+    versions_dir = os.path.join(key_dir, "versions")
+    os.makedirs(versions_dir, exist_ok=True)
 
-    # Create directory structure if needed
-    os.makedirs(key_dir, exist_ok=True)
+    try:
+        owner_exists = _check_owner(key_dir, email)
+    except PermissionError as exc:
+        return None, str(exc)
 
-    # Check ownership
-    owner_exists = _check_owner(key_dir, email)
-
-    # If no owner yet, set ownership
     if not owner_exists:
         _set_owner(key_dir, email)
 
-    # Determine next version
-    version = _get_next_version(key_dir)
-    timestamp = time.time()
+    version = _get_next_version(versions_dir)
 
-    # Build version data
-    version_data = {
-        'key': key,
-        'value': value,
-        'version': version,
-        'timestamp': timestamp,
-        'email': email,
+    # Determine file extension from content type
+    ext = ""
+    if content_type:
+        guessed = mimetypes.guess_extension(content_type)
+        if guessed:
+            ext = guessed
+
+    version_filename = f"v{version}{ext}" if ext else f"v{version}"
+    version_path = os.path.join(versions_dir, version_filename)
+
+    # Write content
+    if isinstance(value, bytes):
+        with open(version_path, "wb") as f:
+            f.write(value)
+    else:
+        with open(version_path, "w", encoding="utf-8") as f:
+            f.write(value)
+
+    # Write metadata sidecar
+    meta = {
+        "version": version,
+        "content_type": content_type or "application/octet-stream",
+        "filename": version_filename,
     }
+    meta_path = os.path.join(versions_dir, f"v{version}.meta.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
 
-    # Write version file
-    version_filename = f'v{version}.json'
-    version_path = os.path.join(key_dir, version_filename)
-
-    with open(version_path, 'w', encoding='utf-8') as f:
-        json.dump(version_data, f, indent=2)
-
-    return {
-        'key': key,
-        'version': version,
-        'timestamp': timestamp,
-        'email': email,
-    }
+    return version, None
 
 
-def read_key(base_dir, key, email):
-    """Read the latest version of a key.
+def read_key(
+    base_dir: str,
+    key: str,
+    email: str,
+    version: int | None = None,
+) -> tuple[bytes | None, dict | None, str | None]:
+    """Read a version of *key* (latest when *version* is None).
 
-    Args:
-        base_dir: Base directory for storage
-        key: The key name
-        email: Email of the user performing the read
-
-    Returns:
-        dict: The version data including key, value, version, timestamp, email
-
-    Raises:
-        KeyError: If the key does not exist
-        PermissionError: If the key is owned by a different email
+    Returns ``(data, meta_dict, None)`` on success or
+    ``(None, None, error_message)`` on failure.
     """
     key_dir = _get_key_dir(base_dir, key)
 
     if not os.path.exists(key_dir):
-        raise KeyError(f"Key not found: '{key}'")
+        return None, None, "Key not found"
 
-    # Check ownership
-    _check_owner(key_dir, email)
+    try:
+        _check_owner(key_dir, email)
+    except PermissionError as exc:
+        return None, None, str(exc)
 
-    # Get latest version
-    latest_path = _get_latest_version_path(key_dir)
+    versions_dir = os.path.join(key_dir, "versions")
+    if not os.path.exists(versions_dir):
+        return None, None, "Key not found"
 
-    if latest_path is None:
-        raise KeyError(f"Key not found: '{key}' (no versions available)")
+    if version is not None:
+        # --- specific version ---
+        meta_path = os.path.join(versions_dir, f"v{version}.meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            version_path = os.path.join(versions_dir, meta["filename"])
+        else:
+            # Fallback: find by prefix
+            found = None
+            for fname in os.listdir(versions_dir):
+                if fname.startswith(f"v{version}") and not fname.endswith(".meta.json"):
+                    found = fname
+                    break
+            if not found:
+                return None, None, "Version not found"
+            version_path = os.path.join(versions_dir, found)
+            meta = {"version": version, "content_type": "application/octet-stream"}
 
-    with open(latest_path, 'r', encoding='utf-8') as f:
-        version_data = json.load(f)
-
-    return version_data
-
-
-def serve_key(base_dir, key, email):
-    """Serve the content of a key's latest version with appropriate content type.
-
-    Args:
-        base_dir: Base directory for storage
-        key: The key name
-        email: Email of the user performing the read
-
-    Returns:
-        tuple: (content, content_type) where content is the raw content and
-               content_type is the MIME type string
-
-    Raises:
-        KeyError: If the key does not exist
-        PermissionError: If the key is owned by a different email
-    """
-    version_data = read_key(base_dir, key, email)
-    value = version_data.get('value')
-
-    # Determine content type based on the value and key
-    content_type = None
-
-    # Try to guess content type from the key name (treat key as filename)
-    guessed_type, _ = mimetypes.guess_type(key)
-    if guessed_type:
-        content_type = guessed_type
-
-    if isinstance(value, (dict, list)):
-        content = json.dumps(value, indent=2)
-        if content_type is None:
-            content_type = 'application/json'
-    elif isinstance(value, str):
-        content = value
-        if content_type is None:
-            # Check if it looks like JSON
-            try:
-                json.loads(value)
-                content_type = 'application/json'
-            except (json.JSONDecodeError, TypeError):
-                content_type = 'text/plain'
-    elif isinstance(value, bytes):
-        content = value
-        if content_type is None:
-            content_type = 'application/octet-stream'
+        if not os.path.exists(version_path):
+            return None, None, "Version not found"
     else:
-        content = str(value)
-        if content_type is None:
-            content_type = 'text/plain'
+        # --- latest version ---
+        latest = _get_latest_version(versions_dir)
+        if latest is None:
+            return None, None, "No versions found"
+        v_num, v_fname = latest
+        meta_path = os.path.join(versions_dir, f"v{v_num}.meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        else:
+            meta = {"version": v_num, "content_type": "application/octet-stream"}
+        version_path = os.path.join(versions_dir, v_fname)
 
-    return (content, content_type)
+    with open(version_path, "rb") as f:
+        data = f.read()
+
+    return data, meta, None
+
+
+def serve_key(
+    base_dir: str,
+    key: str,
+    email: str,
+    version: int | None = None,
+) -> tuple[bytes | None, str | None, str | None]:
+    """Convenience wrapper that returns ``(data, content_type, error)``."""
+    data, meta, error = read_key(base_dir, key, email, version)
+    if error:
+        return None, None, error
+    content_type = meta.get("content_type", "application/octet-stream")
+    return data, content_type, None

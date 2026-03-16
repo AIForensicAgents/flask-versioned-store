@@ -1,358 +1,212 @@
-import os
-import json
 import hashlib
+import json
+import os
+import time
 import mimetypes
 
 
-class VersionedKVStore:
-    def __init__(self, base_dir="./storage", hash_algo="sha256", depth=3):
-        self.base_dir = base_dir
-        self.hash_algo = hash_algo
-        self.depth = depth
-        os.makedirs(self.base_dir, exist_ok=True)
+def _get_key_dir(base_dir, key):
+    """Compute the 3-level directory structure from the SHA256 hash of the key."""
+    key_hash = hashlib.sha256(key.encode('utf-8')).hexdigest()
+    level1 = key_hash[0:2]
+    level2 = key_hash[2:4]
+    level3 = key_hash[4:6]
+    return os.path.join(base_dir, level1, level2, level3, key_hash)
 
-    def _hash_key(self, key):
-        if self.hash_algo == "md5":
-            h = hashlib.md5(key.encode("utf-8")).hexdigest()
-        else:
-            h = hashlib.sha256(key.encode("utf-8")).hexdigest()
-        return h
 
-    def _key_dir(self, key):
-        h = self._hash_key(key)
-        parts = []
-        for i in range(self.depth):
-            start = i * 2
-            end = start + 2
-            parts.append(h[start:end])
-        parts.append(h)
-        return os.path.join(self.base_dir, *parts)
-
-    def _get_versions(self, key_dir):
-        if not os.path.isdir(key_dir):
-            return []
-        versions = []
-        for fname in os.listdir(key_dir):
-            if fname.startswith("v") and fname.endswith(".json"):
-                try:
-                    version_num = int(fname[1:].replace(".json", ""))
-                    versions.append(version_num)
-                except ValueError:
-                    continue
-        versions.sort()
-        return versions
-
-    def _latest_version(self, key_dir):
-        versions = self._get_versions(key_dir)
-        if not versions:
-            return None
-        return versions[-1]
-
-    def _next_version(self, key_dir):
-        latest = self._latest_version(key_dir)
-        if latest is None:
-            return 1
-        return latest + 1
-
-    def _version_file(self, key_dir, version):
-        return os.path.join(key_dir, "v{}.json".format(version))
-
-    def write(self, key, value, metadata=None):
-        key_dir = self._key_dir(key)
-        os.makedirs(key_dir, exist_ok=True)
-        version = self._next_version(key_dir)
-        record = {
-            "key": key,
-            "version": version,
-            "value": value,
-        }
-        if metadata is not None:
-            record["metadata"] = metadata
-        filepath = self._version_file(key_dir, version)
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(record, f, ensure_ascii=False, indent=2)
-        return version
-
-    def read(self, key, version=None):
-        key_dir = self._key_dir(key)
-        if version is None:
-            version = self._latest_version(key_dir)
-        if version is None:
-            raise KeyError("Key '{}' not found".format(key))
-        filepath = self._version_file(key_dir, version)
-        if not os.path.isfile(filepath):
-            raise KeyError(
-                "Key '{}' version {} not found".format(key, version)
+def _check_owner(key_dir, email):
+    """Check owner.json in the key directory. Returns True if owner matches or no owner exists yet.
+    Raises PermissionError if owner doesn't match."""
+    owner_path = os.path.join(key_dir, 'owner.json')
+    if os.path.exists(owner_path):
+        with open(owner_path, 'r', encoding='utf-8') as f:
+            owner_data = json.load(f)
+        if owner_data.get('email') != email:
+            raise PermissionError(
+                f"Permission denied: key is owned by '{owner_data.get('email')}', "
+                f"not '{email}'"
             )
-        with open(filepath, "r", encoding="utf-8") as f:
-            record = json.load(f)
-        return record
+        return True
+    return False
 
-    def read_value(self, key, version=None):
-        record = self.read(key, version=version)
-        return record["value"]
 
-    def list_versions(self, key):
-        key_dir = self._key_dir(key)
-        return self._get_versions(key_dir)
+def _set_owner(key_dir, email):
+    """Write owner.json to claim ownership of a key directory."""
+    owner_path = os.path.join(key_dir, 'owner.json')
+    owner_data = {'email': email}
+    with open(owner_path, 'w', encoding='utf-8') as f:
+        json.dump(owner_data, f, indent=2)
 
-    def delete(self, key, version=None):
-        key_dir = self._key_dir(key)
-        if version is not None:
-            filepath = self._version_file(key_dir, version)
-            if os.path.isfile(filepath):
-                os.remove(filepath)
-                return True
-            return False
-        else:
-            if not os.path.isdir(key_dir):
-                return False
-            versions = self._get_versions(key_dir)
-            for v in versions:
-                filepath = self._version_file(key_dir, v)
-                if os.path.isfile(filepath):
-                    os.remove(filepath)
-            # Try to remove directories up the tree
+
+def _get_versions(key_dir):
+    """Get sorted list of version files in the key directory."""
+    versions = []
+    if not os.path.exists(key_dir):
+        return versions
+    for filename in os.listdir(key_dir):
+        if filename.startswith('v') and filename.endswith('.json'):
             try:
-                os.removedirs(key_dir)
-            except OSError:
-                pass
-            return True
-
-    def exists(self, key):
-        key_dir = self._key_dir(key)
-        return len(self._get_versions(key_dir)) > 0
+                version_num = int(filename[1:].replace('.json', ''))
+                versions.append((version_num, filename))
+            except ValueError:
+                continue
+    versions.sort(key=lambda x: x[0])
+    return versions
 
 
-def _detect_content_type(value):
-    if value is None:
-        return b"", "application/octet-stream"
-
-    # If value is bytes (stored as base64 or list of ints), try to detect
-    if isinstance(value, (list,)):
-        # Assume list of byte values
-        try:
-            data_bytes = bytes(value)
-        except (TypeError, ValueError):
-            data_bytes = json.dumps(value).encode("utf-8")
-            return data_bytes, "application/json"
-        # Try to guess from magic bytes
-        content_type = _guess_from_magic(data_bytes)
-        if content_type:
-            return data_bytes, content_type
-        return data_bytes, "application/octet-stream"
-
-    if isinstance(value, dict):
-        data_bytes = json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
-        return data_bytes, "application/json"
-
-    if isinstance(value, (int, float, bool)):
-        data_bytes = json.dumps(value).encode("utf-8")
-        return data_bytes, "application/json"
-
-    # String value
-    if isinstance(value, str):
-        stripped = value.strip()
-
-        # Check if it looks like JSON
-        if (stripped.startswith("{") and stripped.endswith("}")) or (
-            stripped.startswith("[") and stripped.endswith("]")
-        ):
-            try:
-                json.loads(stripped)
-                return stripped.encode("utf-8"), "application/json"
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-        # Check if it looks like HTML
-        lower = stripped.lower()
-        if (
-            lower.startswith("<!doctype html")
-            or lower.startswith("<html")
-            or lower.startswith("<!")
-            or ("<html" in lower and "</html>" in lower)
-        ):
-            return stripped.encode("utf-8"), "text/html"
-
-        # Check if it looks like XML
-        if lower.startswith("<?xml") or (
-            lower.startswith("<") and "xmlns" in lower
-        ):
-            return stripped.encode("utf-8"), "application/xml"
-
-        # Check if it looks like CSS
-        if "{" in stripped and "}" in stripped and (":" in stripped) and (
-            ";" in stripped
-        ):
-            # Rough heuristic for CSS
-            css_keywords = ["color", "margin", "padding", "font", "display", "background", "border"]
-            if any(kw in lower for kw in css_keywords):
-                return stripped.encode("utf-8"), "text/css"
-
-        # Check if it looks like SVG
-        if "<svg" in lower:
-            return stripped.encode("utf-8"), "image/svg+xml"
-
-        # Plain text
-        return stripped.encode("utf-8"), "text/plain"
-
-    # Fallback
-    data_bytes = str(value).encode("utf-8")
-    return data_bytes, "text/plain"
+def _get_next_version(key_dir):
+    """Get the next version number for a key."""
+    versions = _get_versions(key_dir)
+    if not versions:
+        return 1
+    return versions[-1][0] + 1
 
 
-def _guess_from_magic(data_bytes):
-    if len(data_bytes) < 4:
+def _get_latest_version_path(key_dir):
+    """Get the file path of the latest version."""
+    versions = _get_versions(key_dir)
+    if not versions:
         return None
-
-    # PNG
-    if data_bytes[:8] == b"\x89PNG\r\n\x1a\n":
-        return "image/png"
-    # JPEG
-    if data_bytes[:2] == b"\xff\xd8":
-        return "image/jpeg"
-    # GIF
-    if data_bytes[:6] in (b"GIF87a", b"GIF89a"):
-        return "image/gif"
-    # BMP
-    if data_bytes[:2] == b"BM":
-        return "image/bmp"
-    # WebP
-    if data_bytes[:4] == b"RIFF" and len(data_bytes) >= 12 and data_bytes[8:12] == b"WEBP":
-        return "image/webp"
-    # PDF
-    if data_bytes[:5] == b"%PDF-":
-        return "application/pdf"
-    # ZIP
-    if data_bytes[:4] == b"PK\x03\x04":
-        return "application/zip"
-    # GZIP
-    if data_bytes[:2] == b"\x1f\x8b":
-        return "application/gzip"
-    # TIFF
-    if data_bytes[:4] in (b"II\x2a\x00", b"MM\x00\x2a"):
-        return "image/tiff"
-    # ICO
-    if data_bytes[:4] == b"\x00\x00\x01\x00":
-        return "image/x-icon"
-
-    return None
+    return os.path.join(key_dir, versions[-1][1])
 
 
-def serve(store, key, version=None):
+def write_key(base_dir, key, value, email):
+    """Write a versioned value for a key.
+
+    Args:
+        base_dir: Base directory for storage
+        key: The key name
+        value: The value to store (can be any JSON-serializable object)
+        email: Email of the user performing the write
+
+    Returns:
+        dict: Metadata about the written version including key, version, timestamp, email
+
+    Raises:
+        PermissionError: If the key is owned by a different email
     """
-    Reads the latest (or specified) version of a key's value,
-    detects the content type, and returns (data_bytes, content_type).
-    """
-    record = store.read(key, version=version)
-    value = record.get("value")
-    metadata = record.get("metadata", {})
+    key_dir = _get_key_dir(base_dir, key)
 
-    # If metadata explicitly has content_type, use it
-    if isinstance(metadata, dict) and "content_type" in metadata:
-        explicit_ct = metadata["content_type"]
-        if isinstance(value, str):
-            data_bytes = value.encode("utf-8")
-        elif isinstance(value, (list,)):
+    # Create directory structure if needed
+    os.makedirs(key_dir, exist_ok=True)
+
+    # Check ownership
+    owner_exists = _check_owner(key_dir, email)
+
+    # If no owner yet, set ownership
+    if not owner_exists:
+        _set_owner(key_dir, email)
+
+    # Determine next version
+    version = _get_next_version(key_dir)
+    timestamp = time.time()
+
+    # Build version data
+    version_data = {
+        'key': key,
+        'value': value,
+        'version': version,
+        'timestamp': timestamp,
+        'email': email,
+    }
+
+    # Write version file
+    version_filename = f'v{version}.json'
+    version_path = os.path.join(key_dir, version_filename)
+
+    with open(version_path, 'w', encoding='utf-8') as f:
+        json.dump(version_data, f, indent=2)
+
+    return {
+        'key': key,
+        'version': version,
+        'timestamp': timestamp,
+        'email': email,
+    }
+
+
+def read_key(base_dir, key, email):
+    """Read the latest version of a key.
+
+    Args:
+        base_dir: Base directory for storage
+        key: The key name
+        email: Email of the user performing the read
+
+    Returns:
+        dict: The version data including key, value, version, timestamp, email
+
+    Raises:
+        KeyError: If the key does not exist
+        PermissionError: If the key is owned by a different email
+    """
+    key_dir = _get_key_dir(base_dir, key)
+
+    if not os.path.exists(key_dir):
+        raise KeyError(f"Key not found: '{key}'")
+
+    # Check ownership
+    _check_owner(key_dir, email)
+
+    # Get latest version
+    latest_path = _get_latest_version_path(key_dir)
+
+    if latest_path is None:
+        raise KeyError(f"Key not found: '{key}' (no versions available)")
+
+    with open(latest_path, 'r', encoding='utf-8') as f:
+        version_data = json.load(f)
+
+    return version_data
+
+
+def serve_key(base_dir, key, email):
+    """Serve the content of a key's latest version with appropriate content type.
+
+    Args:
+        base_dir: Base directory for storage
+        key: The key name
+        email: Email of the user performing the read
+
+    Returns:
+        tuple: (content, content_type) where content is the raw content and
+               content_type is the MIME type string
+
+    Raises:
+        KeyError: If the key does not exist
+        PermissionError: If the key is owned by a different email
+    """
+    version_data = read_key(base_dir, key, email)
+    value = version_data.get('value')
+
+    # Determine content type based on the value and key
+    content_type = None
+
+    # Try to guess content type from the key name (treat key as filename)
+    guessed_type, _ = mimetypes.guess_type(key)
+    if guessed_type:
+        content_type = guessed_type
+
+    if isinstance(value, (dict, list)):
+        content = json.dumps(value, indent=2)
+        if content_type is None:
+            content_type = 'application/json'
+    elif isinstance(value, str):
+        content = value
+        if content_type is None:
+            # Check if it looks like JSON
             try:
-                data_bytes = bytes(value)
-            except (TypeError, ValueError):
-                data_bytes = json.dumps(value).encode("utf-8")
-        elif isinstance(value, (dict, int, float, bool)):
-            data_bytes = json.dumps(value, ensure_ascii=False).encode("utf-8")
-        elif isinstance(value, bytes):
-            data_bytes = value
-        else:
-            data_bytes = str(value).encode("utf-8")
-        return data_bytes, explicit_ct
+                json.loads(value)
+                content_type = 'application/json'
+            except (json.JSONDecodeError, TypeError):
+                content_type = 'text/plain'
+    elif isinstance(value, bytes):
+        content = value
+        if content_type is None:
+            content_type = 'application/octet-stream'
+    else:
+        content = str(value)
+        if content_type is None:
+            content_type = 'text/plain'
 
-    data_bytes, content_type = _detect_content_type(value)
-    return data_bytes, content_type
-
-
-# Convenience functions at module level
-_default_store = None
-
-
-def get_default_store(base_dir="./storage", hash_algo="sha256", depth=3):
-    global _default_store
-    if _default_store is None or _default_store.base_dir != base_dir:
-        _default_store = VersionedKVStore(
-            base_dir=base_dir, hash_algo=hash_algo, depth=depth
-        )
-    return _default_store
-
-
-if __name__ == "__main__":
-    # Demo / self-test
-    import tempfile
-    import shutil
-
-    test_dir = tempfile.mkdtemp(prefix="vkv_test_")
-    print("Test storage dir:", test_dir)
-
-    try:
-        store = VersionedKVStore(base_dir=test_dir, depth=3)
-
-        # Write some versions
-        v1 = store.write("greeting", "Hello, World!")
-        print("Wrote version:", v1)
-
-        v2 = store.write("greeting", "Hello, World! v2")
-        print("Wrote version:", v2)
-
-        v3 = store.write("greeting", {"message": "Hello, World!", "version": 3})
-        print("Wrote version:", v3)
-
-        # Read latest
-        latest = store.read_value("greeting")
-        print("Latest value:", latest)
-
-        # Read specific version
-        val_v1 = store.read_value("greeting", version=1)
-        print("Version 1 value:", val_v1)
-
-        # List versions
-        versions = store.list_versions("greeting")
-        print("All versions:", versions)
-
-        # Serve - JSON
-        store.write("config", {"database": "localhost", "port": 5432})
-        data, ct = serve(store, "config")
-        print("Serve config -> content_type:", ct, "data:", data.decode("utf-8"))
-
-        # Serve - HTML
-        store.write("page", "<!DOCTYPE html><html><body><h1>Hello</h1></body></html>")
-        data, ct = serve(store, "page")
-        print("Serve page -> content_type:", ct)
-
-        # Serve - plain text
-        store.write("note", "Just a plain text note.")
-        data, ct = serve(store, "note")
-        print("Serve note -> content_type:", ct)
-
-        # Serve with explicit content_type metadata
-        store.write(
-            "image_ref",
-            [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0],
-            metadata={"content_type": "image/png"},
-        )
-        data, ct = serve(store, "image_ref")
-        print("Serve image_ref -> content_type:", ct, "bytes:", len(data))
-
-        # Exists check
-        print("Exists 'greeting':", store.exists("greeting"))
-        print("Exists 'nonexistent':", store.exists("nonexistent"))
-
-        # Delete specific version
-        store.delete("greeting", version=1)
-        print("Versions after deleting v1:", store.list_versions("greeting"))
-
-        # Delete all
-        store.delete("greeting")
-        print("Exists 'greeting' after delete:", store.exists("greeting"))
-
-        print("\nAll tests passed!")
-
-    finally:
-        shutil.rmtree(test_dir, ignore_errors=True)
+    return (content, content_type)

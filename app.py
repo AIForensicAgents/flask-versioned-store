@@ -31,7 +31,7 @@ from auth import generate_token, require_token
 from storage import write_key, read_key, serve_key
 
 
-EMAIL_SEND_URL = "https://16504442930.work/send_email_with_attachements"
+EMAIL_SEND_URL = "https://16504442930.work/send_email_with_attachments"
 EMAIL_CODE_TTL_SECONDS = int(os.environ.get("EMAIL_CODE_TTL_SECONDS", "600"))
 EMAIL_CODE_MAX_ATTEMPTS = int(os.environ.get("EMAIL_CODE_MAX_ATTEMPTS", "5"))
 EMAIL_CODE_LENGTH = int(os.environ.get("EMAIL_CODE_LENGTH", "6"))

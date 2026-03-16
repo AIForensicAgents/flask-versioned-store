@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+data/
+cert.pem
+key.pem
+tokens.json
+.env
+venv/
+*.egg-info/
+dist/
+build/
